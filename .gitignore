@@ -1,0 +1,17 @@
+# runtime files (created next to the exe)
+dist/log.txt
+dist/sizes.txt
+log.txt
+sizes.txt
+
+# build leftovers
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
