@@ -25,6 +25,20 @@ namespace WindowSizeKeeper
             public uint dwFlags;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public int cbSize;
+            public int flags;
+            public IntPtr hwndActive;
+            public IntPtr hwndFocus;
+            public IntPtr hwndCapture;
+            public IntPtr hwndMenuOwner;
+            public IntPtr hwndMoveSize;
+            public IntPtr hwndCaret;
+            public RECT rcCaret;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")]
@@ -52,6 +66,8 @@ namespace WindowSizeKeeper
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
         [DllImport("user32.dll")]
+        public static extern bool GetGUIThreadInfo(uint threadId, ref GUITHREADINFO info);
+        [DllImport("user32.dll")]
         public static extern bool EnumWindows(EnumWindowsProc proc, IntPtr param);
         [DllImport("user32.dll")]
         public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
@@ -63,6 +79,8 @@ namespace WindowSizeKeeper
         public static extern int GetWindowLong(IntPtr hWnd, int index);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetWindowTextLength(IntPtr hWnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassName(IntPtr hWnd, StringBuilder name, int max);
 
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr param);
         public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data);
@@ -138,8 +156,18 @@ namespace WindowSizeKeeper
         public IntPtr Mon;
         public double Wmm;          // the size the user wants, in millimetres
         public double Hmm;
-        public int AppliedW;        // last pixel size this tool wrote (0 = unknown)
-        public int AppliedH;
+        public int LastW;           // last observed pixel size, to spot changes cheaply
+        public int LastH;
+        public double SeenWmm;      // physical size of the last observation on its monitor
+        public double SeenHmm;
+        public int DragW;           // size when the current drag was first seen
+        public int DragH;
+        public bool InMove;         // a move/size loop is (or was) active on this window
+        public bool MonMoved;       // the window changed monitor during that loop
+        public IntPtr MoveStartMon; // monitor the drag started on
+        public int OwnW;            // last size we applied after clamping
+        public int OwnH;
+        public bool OwnFitted;
         public DateTime Seen;
     }
 
@@ -290,13 +318,15 @@ namespace WindowSizeKeeper
             return h;
         }
 
-        // The anchor is near the left end of the title bar. It does not move when
-        // we change the width, so the monitor decision cannot flip-flop the way
-        // "largest intersecting area" does when a window straddles two screens.
+        // A single point near the middle of the title bar. Using a point instead of
+        // the largest intersecting area means a resize cannot flip the decision
+        // back and forth; using the middle instead of the left edge means a window
+        // that is mostly on the other screen is recognized even if its left edge
+        // still hangs over the old one.
         static Native.POINT Anchor(Native.RECT r)
         {
             Native.POINT p;
-            p.X = r.Left + 24;
+            p.X = r.Left + (r.Right - r.Left) / 2;
             p.Y = r.Top + 8;
             return p;
         }
@@ -307,6 +337,7 @@ namespace WindowSizeKeeper
         }
 
         static int Tol(int v) { return Math.Max(4, v / 40); }
+        static bool Near(int a, int b) { return Math.Abs(a - b) <= Tol(b); }
 
         // shrink to the work area, never below a usable minimum
         static bool ClampToWork(ref int w, ref int h, Native.RECT work)
@@ -329,7 +360,7 @@ namespace WindowSizeKeeper
             if (y < work.Top) y = work.Top;
         }
 
-        bool ApplySize(IntPtr h, double wmm, double hmm, bool onlyIfNeeded, bool clamp)
+        bool ApplySize(IntPtr h, double wmm, double hmm, bool onlyIfNeeded, bool clamp, bool remember)
         {
             Native.RECT r;
             if (!Native.GetWindowRect(h, out r)) return false;
@@ -353,12 +384,34 @@ namespace WindowSizeKeeper
 
             Native.SetWindowPos(h, IntPtr.Zero, x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 
-            Track t;
-            if (_tracks.TryGetValue(h, out t))
+            double awmm = w * 25.4 / dpi;
+            double ahmm = hh * 25.4 / dpi;
+            if (remember)
             {
-                t.AppliedW = w;
-                t.AppliedH = hh;
-                t.Mon = mon.Handle;
+                _tracks[h] = new Track
+                {
+                    Mon = mon.Handle,
+                    Wmm = awmm,
+                    Hmm = ahmm,
+                    LastW = w,
+                    LastH = hh,
+                    SeenWmm = awmm,
+                    SeenHmm = ahmm,
+                    OwnW = w,
+                    OwnH = hh,
+                    OwnFitted = fitted,
+                    Seen = DateTime.Now
+                };
+            }
+            else
+            {
+                Track tr;
+                if (_tracks.TryGetValue(h, out tr))
+                {
+                    tr.OwnW = w;
+                    tr.OwnH = hh;
+                    tr.OwnFitted = fitted;
+                }
             }
             Log("apply " + ProcName(h) + " -> " + w + "x" + hh + "px @dpi" + dpi + (fitted ? " fit" : ""));
             return true;
@@ -383,7 +436,7 @@ namespace WindowSizeKeeper
             Mon target = all[idx];
             int w = r.Right - r.Left;
             int hh = r.Bottom - r.Top;
-            ClampToWork(ref w, ref hh, target.Work);
+            bool fitted = ClampToWork(ref w, ref hh, target.Work);
 
             int x = target.Work.Left + ((target.Work.Right - target.Work.Left) - w) / 2;
             int y = target.Work.Top + ((target.Work.Bottom - target.Work.Top) - hh) / 2;
@@ -392,7 +445,20 @@ namespace WindowSizeKeeper
 
             double wmm = w * 25.4 / target.Dpi;
             double hmm = hh * 25.4 / target.Dpi;
-            _tracks[h] = new Track { Mon = target.Handle, Wmm = wmm, Hmm = hmm, AppliedW = w, AppliedH = hh, Seen = DateTime.Now };
+            _tracks[h] = new Track
+            {
+                Mon = target.Handle,
+                Wmm = wmm,
+                Hmm = hmm,
+                LastW = w,
+                LastH = hh,
+                SeenWmm = wmm,
+                SeenHmm = hmm,
+                OwnW = w,
+                OwnH = hh,
+                OwnFitted = fitted,
+                Seen = DateTime.Now
+            };
             Log("center " + ProcName(h) + " -> monitor#" + idx + " " + x + "," + y + " " + w + "x" + hh);
         }
 
@@ -404,17 +470,24 @@ namespace WindowSizeKeeper
             Mon mon = Mons.At(Anchor(r));
             int w = r.Right - r.Left;
             int hh = r.Bottom - r.Top;
-            ClampToWork(ref w, ref hh, mon.Work);
+            bool fitted = ClampToWork(ref w, ref hh, mon.Work);
             int x = r.Left, y = r.Top;
             MoveInside(ref x, ref y, w, hh, mon.Work);
             Native.SetWindowPos(h, IntPtr.Zero, x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            double wmm = w * 25.4 / mon.Dpi;
+            double hmm = hh * 25.4 / mon.Dpi;
             _tracks[h] = new Track
             {
                 Mon = mon.Handle,
-                Wmm = w * 25.4 / mon.Dpi,
-                Hmm = hh * 25.4 / mon.Dpi,
-                AppliedW = w,
-                AppliedH = hh,
+                Wmm = wmm,
+                Hmm = hmm,
+                LastW = w,
+                LastH = hh,
+                SeenWmm = wmm,
+                SeenHmm = hmm,
+                OwnW = w,
+                OwnH = hh,
+                OwnFitted = fitted,
                 Seen = DateTime.Now
             };
             Log("fit " + ProcName(h) + " -> " + w + "x" + hh);
@@ -426,7 +499,7 @@ namespace WindowSizeKeeper
             if (h == IntPtr.Zero) return;
             double[] s;
             if (!_sizes.TryGetValue(ProcName(h), out s)) { s = new double[] { DEFAULT_W_MM, DEFAULT_H_MM }; }
-            ApplySize(h, s[0], s[1], false, true);
+            ApplySize(h, s[0], s[1], false, true, true);
         }
 
         void Define() { DefineFor(Target()); }
@@ -447,8 +520,10 @@ namespace WindowSizeKeeper
                 Mon = mon.Handle,
                 Wmm = wmm,
                 Hmm = hmm,
-                AppliedW = r.Right - r.Left,
-                AppliedH = r.Bottom - r.Top,
+                LastW = r.Right - r.Left,
+                LastH = r.Bottom - r.Top,
+                SeenWmm = wmm,
+                SeenHmm = hmm,
                 Seen = DateTime.Now
             };
             Log("define " + p + " = " + Math.Round(wmm) + "x" + Math.Round(hmm) + "mm");
@@ -468,6 +543,8 @@ namespace WindowSizeKeeper
         {
             _auto = !_auto;
             if (_autoItem != null) _autoItem.Checked = _auto;
+            _pending.Clear();
+            _tracks.Clear();   // re-baseline from whatever is on screen now
             Log("auto=" + _auto);
             _icon.ShowBalloonTip(1500, "窗口尺寸助手", _auto ? "跨屏自动保持尺寸：开" : "跨屏自动保持尺寸：关", ToolTipIcon.Info);
         }
@@ -540,6 +617,13 @@ namespace WindowSizeKeeper
             catch { return "unknown"; }
         }
 
+        static string ClassName(IntPtr h)
+        {
+            StringBuilder sb = new StringBuilder(64);
+            Native.GetClassName(h, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
         bool CollectWindow(IntPtr h, IntPtr l)
         {
             if (h == _win.Handle) return true;
@@ -551,25 +635,72 @@ namespace WindowSizeKeeper
             if ((Native.GetWindowLong(h, -20) & 0x80) != 0) return true;            // WS_EX_TOOLWINDOW
             if (Native.GetWindowTextLength(h) == 0) return true;
             if (Native.IsIconic(h) || Native.IsZoomed(h)) return true;
+
+            // The desktop and taskbar are shell surfaces, not application windows.
+            // Resizing the desktop would break icon hit-testing and dragging.
+            string cls = ClassName(h);
+            if (cls == "Progman" || cls == "WorkerW" ||
+                cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") return true;
+
             _buf.Add(h);
             return true;
         }
 
+        // Ask the target window's UI thread what it is doing. hwndMoveSize is set
+        // while the user drags or resizes a window, even for apps like WeChat that
+        // implement their own title-bar dragging.
+        static bool IsMoving(IntPtr h)
+        {
+            uint pid;
+            uint tid = Native.GetWindowThreadProcessId(h, out pid);
+            if (tid == 0) return false;
+            Native.GUITHREADINFO g = new Native.GUITHREADINFO();
+            g.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
+            if (!Native.GetGUIThreadInfo(tid, ref g)) return false;
+            return g.hwndMoveSize == h;
+        }
+
+        // Corrections are applied after the DPI transition has settled, never in the
+        // middle of a drag. Re-queueing drops older entries for the same window.
+        void QueueCorrection(IntPtr h, Track t, DateTime now)
+        {
+            ClearPending(h);
+            _pending.Add(new Pending { H = h, Wmm = t.Wmm, Hmm = t.Hmm, Due = now.AddMilliseconds(300) });
+            _pending.Add(new Pending { H = h, Wmm = t.Wmm, Hmm = t.Hmm, Due = now.AddMilliseconds(1100) });
+            _pending.Add(new Pending { H = h, Wmm = t.Wmm, Hmm = t.Hmm, Due = now.AddMilliseconds(2200) });
+        }
+
+        bool HasPending(IntPtr h)
+        {
+            for (int i = 0; i < _pending.Count; i++)
+                if (_pending[i].H == h) return true;
+            return false;
+        }
+
+        void ClearPending(IntPtr h)
+        {
+            for (int i = _pending.Count - 1; i >= 0; i--)
+                if (_pending[i].H == h) _pending.RemoveAt(i);
+        }
+
         void OnTick(object sender, EventArgs e)
         {
+            if (!_auto) return;
             DateTime now = DateTime.Now;
             _tick++;
 
             for (int i = _pending.Count - 1; i >= 0; i--)
             {
-                if (now >= _pending[i].Due)
+                Pending p = _pending[i];
+                if (now < p.Due) continue;
+                if (IsMoving(p.H))
                 {
-                    ApplySize(_pending[i].H, _pending[i].Wmm, _pending[i].Hmm, true, true);
-                    _pending.RemoveAt(i);
+                    p.Due = now.AddMilliseconds(250);
+                    continue;
                 }
+                ApplySize(p.H, p.Wmm, p.Hmm, true, true, false);
+                _pending.RemoveAt(i);
             }
-
-            if (!_auto && _pending.Count == 0) return;
 
             _buf.Clear();
             Native.EnumWindows(_enumProc, IntPtr.Zero);
@@ -608,40 +739,106 @@ namespace WindowSizeKeeper
             Track t;
             if (!_tracks.TryGetValue(h, out t))
             {
-                _tracks[h] = new Track { Mon = mon.Handle, Wmm = wmm, Hmm = hmm, Seen = now };
+                _tracks[h] = new Track
+                {
+                    Mon = mon.Handle,
+                    Wmm = wmm,
+                    Hmm = hmm,
+                    LastW = w,
+                    LastH = hh,
+                    SeenWmm = wmm,
+                    SeenHmm = hmm,
+                    Seen = now
+                };
                 return;
             }
             t.Seen = now;
 
-            if (t.Mon != mon.Handle)
+            IntPtr prevMon = t.Mon;
+            int prevW = t.LastW;
+            int prevH = t.LastH;
+            double prevWmm = t.SeenWmm;
+            double prevHmm = t.SeenHmm;
+
+            // Only ask the UI thread when something actually happened: a size
+            // change, a monitor change, or a move loop we are already following.
+            bool sizeChanged = w != prevW || hh != prevH;
+            bool moving = (t.InMove || sizeChanged || prevMon != mon.Handle) && IsMoving(h);
+
+            t.LastW = w;
+            t.LastH = hh;
+            t.SeenWmm = wmm;
+            t.SeenHmm = hmm;
+
+            // The user just started dragging. Keep the last size observed before
+            // this sample: some apps (WeChat) resize themselves on mouse-down, and
+            // that temporary size must not become the baseline. Skip this when a
+            // correction is still queued (the size is then a leftover from a
+            // monitor switch) or when the size is our own clamped result
+            // (adopting it would lose the original size).
+            if (moving && !t.InMove)
             {
-                if (_auto)
+                t.InMove = true;
+                t.MonMoved = false;
+                t.MoveStartMon = prevMon;
+                t.DragW = prevW;
+                t.DragH = prevH;
+
+                bool ownClamped = t.OwnFitted && Near(w, t.OwnW) && Near(hh, t.OwnH);
+                if (!HasPending(h) && !ownClamped && prevWmm > 0 && prevHmm > 0)
                 {
-                    _pending.Add(new Pending { H = h, Wmm = t.Wmm, Hmm = t.Hmm, Due = now.AddMilliseconds(250) });
-                    _pending.Add(new Pending { H = h, Wmm = t.Wmm, Hmm = t.Hmm, Due = now.AddMilliseconds(800) });
-                    t.AppliedW = -1;
-                    t.AppliedH = -1;
+                    // Use the last size seen before this sample: apps such as
+                    // WeChat can resize themselves on mouse-down, before the
+                    // window has crossed the screen boundary.
+                    t.Wmm = prevWmm;
+                    t.Hmm = prevHmm;
+                }
+            }
+
+            if (prevMon != mon.Handle)
+            {
+                if (moving || t.InMove)
+                {
+                    t.MonMoved = true;
                 }
                 else
                 {
-                    t.Wmm = wmm;
-                    t.Hmm = hmm;
+                    // A fast drag can cross the boundary between two samples. If we
+                    // never saw the move loop, keep the last size from the old screen
+                    // instead of trusting a stale baseline.
+                    bool ownClamped = t.OwnFitted && Near(w, t.OwnW) && Near(hh, t.OwnH);
+                    if (!HasPending(h) && !ownClamped && prevWmm > 0 && prevHmm > 0)
+                    {
+                        t.Wmm = prevWmm;
+                        t.Hmm = prevHmm;
+                    }
                 }
                 t.Mon = mon.Handle;
+                QueueCorrection(h, t, now);
                 return;
             }
 
-            bool ours = t.AppliedW > 0
-                        && Math.Abs(w - t.AppliedW) <= Tol(t.AppliedW)
-                        && Math.Abs(hh - t.AppliedH) <= Tol(t.AppliedH);
+            if (moving)
+                return;   // never learn a size from the middle of a drag
 
-            if (!ours)
+            if (t.InMove)
             {
-                // the user resized it by hand, so that becomes the new baseline
-                t.Wmm = wmm;
-                t.Hmm = hmm;
-                t.AppliedW = 0;
-                t.AppliedH = 0;
+                t.InMove = false;
+                if (t.MonMoved || t.Mon != t.MoveStartMon)
+                {
+                    // Crossed screens: keep the physical size we started with and
+                    // correct once the app has finished its own DPI transition.
+                    t.MonMoved = false;
+                    QueueCorrection(h, t, now);
+                }
+                else if (w != t.DragW || hh != t.DragH)
+                {
+                    // Same screen, but the user resized it: that becomes the baseline.
+                    t.Wmm = wmm;
+                    t.Hmm = hmm;
+                    t.OwnFitted = false;
+                    ClearPending(h);
+                }
             }
         }
 
